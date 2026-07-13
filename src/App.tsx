@@ -1,4 +1,4 @@
-import React, { useState, useMemo, useEffect, useCallback } from 'react';
+import React, { useState, useMemo, useEffect, useCallback, useRef } from 'react';
 import { Fuel, Timer, Gauge, Calculator, Info, Flag, Wrench, Settings2, ListChecks, ArrowRightLeft, Clock, AlertTriangle, Save, Bookmark, Maximize, Minimize, Trash2, X, Play, CloudRain } from 'lucide-react';
 
 interface Preset {
@@ -20,6 +20,42 @@ interface Preset {
   extraLaps: number | '';
   strategyType: 'equal' | 'full';
 }
+
+type ConnectionStatus = 'disconnected' | 'connecting' | 'connected' | 'error';
+
+interface AccBridgeTelemetry {
+  packetId?: number;
+  fuel?: number;
+  fuelPerLap?: number;
+  lap?: number;
+  position?: number;
+  currentLapTime?: string;
+  lastLapTime?: string;
+  bestLapTime?: string;
+  isInPit?: boolean;
+  isInPitLane?: boolean;
+  rainIntensity?: number;
+  trackGripStatus?: number;
+  trackLength?: number;
+  maxFuel?: number;
+  connected?: boolean;
+}
+
+interface AccBridgeFrame {
+  telemetry?: AccBridgeTelemetry;
+  strategy?: {
+    pitRecommended?: boolean;
+    estimatedLapsRemaining?: number;
+    summary?: string;
+  };
+}
+
+const DEFAULT_ACC_BRIDGE_URL = 'ws://localhost:8081';
+
+const roundTo = (value: number, digits: number) => {
+  const scale = 10 ** digits;
+  return Math.round(value * scale) / scale;
+};
 
 export default function App() {
   const [raceDuration, setRaceDuration] = useState<number | ''>(60);
@@ -54,8 +90,16 @@ export default function App() {
   const [isSimpleMode, setIsSimpleMode] = useState(false);
   const [showEmergency, setShowEmergency] = useState(false);
 
+  // ACC Bridge Sync State
+  const [accBridgeStatus, setAccBridgeStatus] = useState<ConnectionStatus>('disconnected');
+  const [accBridgeUrl, setAccBridgeUrl] = useState(() => localStorage.getItem('acc-bridge-url') || DEFAULT_ACC_BRIDGE_URL);
+  const [isAccBridgeModalOpen, setIsAccBridgeModalOpen] = useState(false);
+  const [accBridgeErrorMsg, setAccBridgeErrorMsg] = useState('');
+  const [accBridgeTelemetry, setAccBridgeTelemetry] = useState<AccBridgeTelemetry | null>(null);
+  const accBridgeSocketRef = useRef<WebSocket | null>(null);
+
   // SimHub Sync State
-  const [simHubStatus, setSimHubStatus] = useState<'disconnected' | 'connecting' | 'connected' | 'error'>('disconnected');
+  const [simHubStatus, setSimHubStatus] = useState<ConnectionStatus>('disconnected');
   const [simHubUrl, setSimHubUrl] = useState(() => {
     // If hosted on SimHub's own web server, use its origin to allow access from other devices (like smartphones)
     if (window.location.port === '8888' || window.location.port === '8889') {
@@ -78,6 +122,89 @@ export default function App() {
         setPresets(JSON.parse(saved));
       } catch (e) {}
     }
+  }, []);
+
+  const disconnectAccBridge = useCallback(() => {
+    accBridgeSocketRef.current?.close();
+    accBridgeSocketRef.current = null;
+    setAccBridgeStatus('disconnected');
+  }, []);
+
+  const applyAccBridgeTelemetry = useCallback((telemetry: AccBridgeTelemetry) => {
+    setAccBridgeTelemetry(telemetry);
+
+    if (telemetry.connected === false) {
+      return;
+    }
+
+    if (typeof telemetry.lap === 'number' && Number.isFinite(telemetry.lap) && telemetry.lap >= 0) {
+      setCurrentLap(telemetry.lap);
+    }
+
+    if (typeof telemetry.fuel === 'number' && Number.isFinite(telemetry.fuel) && telemetry.fuel >= 0) {
+      setCurrentFuel(roundTo(telemetry.fuel, 1));
+    }
+
+    if (typeof telemetry.fuelPerLap === 'number' && Number.isFinite(telemetry.fuelPerLap) && telemetry.fuelPerLap > 0) {
+      setFuelPerLap(roundTo(telemetry.fuelPerLap, 2));
+    }
+
+    if (typeof telemetry.maxFuel === 'number' && Number.isFinite(telemetry.maxFuel) && telemetry.maxFuel > 0) {
+      setTankCapacity(roundTo(telemetry.maxFuel, 1));
+    }
+
+    if (typeof telemetry.rainIntensity === 'number' && Number.isFinite(telemetry.rainIntensity)) {
+      setIsRaining(telemetry.rainIntensity > 0);
+    }
+  }, []);
+
+  const connectAccBridge = useCallback(() => {
+    disconnectAccBridge();
+    setAccBridgeStatus('connecting');
+    setAccBridgeErrorMsg('');
+
+    try {
+      const socket = new WebSocket(accBridgeUrl);
+      accBridgeSocketRef.current = socket;
+
+      socket.onopen = () => {
+        localStorage.setItem('acc-bridge-url', accBridgeUrl);
+        setAccBridgeStatus('connected');
+        setIsAccBridgeModalOpen(false);
+      };
+
+      socket.onmessage = (event) => {
+        try {
+          const parsed = JSON.parse(String(event.data)) as AccBridgeFrame | AccBridgeTelemetry;
+          const telemetry = 'telemetry' in parsed && parsed.telemetry ? parsed.telemetry : parsed as AccBridgeTelemetry;
+          applyAccBridgeTelemetry(telemetry);
+        } catch (error) {
+          console.error('ACC Bridge parse error:', error);
+        }
+      };
+
+      socket.onerror = () => {
+        setAccBridgeStatus('error');
+        setAccBridgeErrorMsg('ACC Bridge に接続できません。C++ ブリッジを起動して URL を確認してください。');
+      };
+
+      socket.onclose = () => {
+        if (accBridgeSocketRef.current === socket) {
+          accBridgeSocketRef.current = null;
+          setAccBridgeStatus((status) => status === 'error' ? 'error' : 'disconnected');
+        }
+      };
+    } catch (error) {
+      console.error('ACC Bridge connection error:', error);
+      setAccBridgeStatus('error');
+      setAccBridgeErrorMsg('WebSocket URL が正しくありません。');
+    }
+  }, [accBridgeUrl, applyAccBridgeTelemetry, disconnectAccBridge]);
+
+  useEffect(() => {
+    return () => {
+      accBridgeSocketRef.current?.close();
+    };
   }, []);
 
   useEffect(() => {
@@ -509,7 +636,28 @@ export default function App() {
       rawLaps,
       brakePadRecommendation
     };
-  }, [raceDuration, lapMin, lapSec, fuelPerLap, extraLaps, tankCapacity, mandatoryPitStops, maxStintTime, strategyType, currentLap, currentFuel, completedMandatoryPits, countsAsMandatory, isRaining]);
+  }, [
+    raceDuration,
+    lapMin,
+    lapSec,
+    fuelPerLap,
+    extraLaps,
+    wetLapMin,
+    wetLapSec,
+    wetFuelPerLap,
+    tankCapacity,
+    mandatoryPitStops,
+    maxStintTime,
+    strategyType,
+    pitLossTime,
+    tireChangeTime,
+    refuelTimePerL,
+    currentLap,
+    currentFuel,
+    completedMandatoryPits,
+    countsAsMandatory,
+    isRaining
+  ]);
 
   const renderEmergencyInput = () => (
     <div className={`bg-gradient-to-br from-slate-900 to-slate-950 border ${isSimpleMode ? 'border-yellow-900/40 p-4' : 'border-slate-800 p-6'} rounded-2xl shadow-xl space-y-4 relative overflow-hidden`}>
@@ -649,6 +797,29 @@ export default function App() {
             </div>
           </div>
           <div className="flex items-center space-x-2">
+            <button
+              onClick={() => setIsAccBridgeModalOpen(true)}
+              className={`flex items-center px-2 sm:px-3 py-1.5 sm:py-2 rounded-xl text-xs font-medium transition-all border ${
+                accBridgeStatus === 'connected'
+                  ? 'bg-red-500/10 text-red-400 border-red-500/30 hover:bg-red-500/20'
+                  : accBridgeStatus === 'error'
+                  ? 'bg-amber-500/10 text-amber-400 border-amber-500/30 hover:bg-amber-500/20'
+                  : 'bg-slate-900 text-slate-300 border-slate-700 hover:bg-slate-800'
+              }`}
+            >
+              <div className={`w-2 h-2 rounded-full mr-1.5 sm:mr-2 ${
+                accBridgeStatus === 'connected' ? 'bg-red-400 animate-pulse' :
+                accBridgeStatus === 'error' ? 'bg-amber-400' : 'bg-slate-500'
+              }`}></div>
+              <span className="hidden sm:inline">
+                {accBridgeStatus === 'connected' ? 'ACC Bridge 連携中' :
+                 accBridgeStatus === 'error' ? 'ACC Bridge エラー' : 'ACC Bridge'}
+              </span>
+              <span className="sm:hidden">
+                {accBridgeStatus === 'connected' ? 'ACC ON' :
+                 accBridgeStatus === 'error' ? 'ACC ERR' : 'ACC'}
+              </span>
+            </button>
             <button
               onClick={() => setIsSimHubModalOpen(true)}
               className={`flex items-center px-2 sm:px-3 py-1.5 sm:py-2 rounded-xl text-xs font-medium transition-all border ${
@@ -1433,6 +1604,111 @@ export default function App() {
           </div>
         </div>
       </div>
+
+      {/* ACC Bridge Connection Modal */}
+      {isAccBridgeModalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm">
+          <div className="bg-slate-900 border border-slate-700 rounded-2xl w-full max-w-md overflow-hidden shadow-2xl">
+            <div className="p-5 border-b border-slate-800 flex justify-between items-center">
+              <h2 className="text-lg font-bold text-white flex items-center">
+                <Gauge className="w-5 h-5 mr-2 text-red-400" />
+                ACC Bridge 連携 (WebSocket)
+              </h2>
+              <button onClick={() => setIsAccBridgeModalOpen(false)} className="text-slate-400 hover:text-white">
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+            <div className="p-5 space-y-4">
+              <p className="text-sm text-slate-300">
+                C++ ブリッジから周回数・燃料・燃費を受信して、戦略計算の入力に反映します。
+              </p>
+
+              <div className="bg-slate-950 p-4 rounded-xl border border-slate-800 space-y-3">
+                <h3 className="text-xs font-bold text-slate-400 uppercase">準備</h3>
+                <ol className="text-sm text-slate-300 list-decimal list-inside space-y-2">
+                  <li>Assetto Corsa Competizione を起動します。</li>
+                  <li><code>acc app.cpp</code> をビルドしたブリッジを実行します。</li>
+                  <li>下の URL がブリッジの待受ポートと一致していることを確認します。</li>
+                </ol>
+              </div>
+
+              <div className="space-y-2">
+                <label className="text-xs font-medium text-slate-400">WebSocket URL</label>
+                <input
+                  type="text"
+                  value={accBridgeUrl}
+                  onChange={(e) => setAccBridgeUrl(e.target.value)}
+                  className="w-full bg-slate-950 border border-slate-700 rounded-lg py-2 px-3 text-white text-sm focus:outline-none focus:border-red-500"
+                  placeholder={DEFAULT_ACC_BRIDGE_URL}
+                />
+              </div>
+
+              {accBridgeTelemetry && (
+                <div className="grid grid-cols-3 gap-3">
+                  <div className="bg-slate-950 border border-slate-800 rounded-xl p-3">
+                    <p className="text-[10px] text-slate-500 uppercase">Lap</p>
+                    <p className="font-mono text-lg font-bold text-white">{accBridgeTelemetry.lap ?? '-'}</p>
+                  </div>
+                  <div className="bg-slate-950 border border-slate-800 rounded-xl p-3">
+                    <p className="text-[10px] text-slate-500 uppercase">Fuel</p>
+                    <p className="font-mono text-lg font-bold text-white">
+                      {typeof accBridgeTelemetry.fuel === 'number' ? `${roundTo(accBridgeTelemetry.fuel, 1)}L` : '-'}
+                    </p>
+                  </div>
+                  <div className="bg-slate-950 border border-slate-800 rounded-xl p-3">
+                    <p className="text-[10px] text-slate-500 uppercase">F/Lap</p>
+                    <p className="font-mono text-lg font-bold text-white">
+                      {typeof accBridgeTelemetry.fuelPerLap === 'number' ? `${roundTo(accBridgeTelemetry.fuelPerLap, 2)}L` : '-'}
+                    </p>
+                  </div>
+                </div>
+              )}
+
+              {accBridgeTelemetry?.connected === false && (
+                <div className="bg-amber-500/10 border border-amber-500/30 text-amber-400 text-sm p-3 rounded-lg">
+                  ブリッジには接続済みですが、ACC の共有メモリはまだ読めていません。
+                </div>
+              )}
+
+              {accBridgeErrorMsg && (
+                <div className="bg-red-500/10 border border-red-500/30 text-red-400 text-sm p-3 rounded-lg">
+                  {accBridgeErrorMsg}
+                </div>
+              )}
+            </div>
+
+            <div className="p-5 border-t border-slate-800 flex justify-end gap-3 bg-slate-950/50">
+              {accBridgeStatus === 'connected' ? (
+                <button
+                  onClick={() => {
+                    disconnectAccBridge();
+                    setIsAccBridgeModalOpen(false);
+                  }}
+                  className="bg-red-600 hover:bg-red-500 text-white font-medium py-2 px-4 rounded-lg transition-colors"
+                >
+                  切断する
+                </button>
+              ) : (
+                <>
+                  <button
+                    onClick={() => setIsAccBridgeModalOpen(false)}
+                    className="text-slate-300 hover:text-white px-4 py-2 text-sm"
+                  >
+                    キャンセル
+                  </button>
+                  <button
+                    onClick={connectAccBridge}
+                    disabled={accBridgeStatus === 'connecting'}
+                    className="bg-red-600 hover:bg-red-500 text-white font-medium py-2 px-4 rounded-lg transition-colors flex items-center"
+                  >
+                    {accBridgeStatus === 'connecting' ? '接続中...' : '接続する'}
+                  </button>
+                </>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* SimHub Connection Modal */}
       {isSimHubModalOpen && (
