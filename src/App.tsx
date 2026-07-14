@@ -86,6 +86,14 @@ export default function App() {
   const [countsAsMandatory, setCountsAsMandatory] = useState<boolean>(true);
   const [isRaining, setIsRaining] = useState<boolean>(false);
 
+  // Live per-lap fuel tracking (テレメトリーから1周ごとの実測燃費を算出)
+  const [lapFuelHistory, setLapFuelHistory] = useState<{ lap: number; fuelUsed: number }[]>([]);
+  const [pitExitPrompt, setPitExitPrompt] = useState<{ lap: number | ''; fuel: number | '' } | null>(null);
+  const lapFuelHistoryRef = useRef<{ lap: number; fuelUsed: number }[]>([]);
+  const lastLapEdgeRef = useRef<{ lap: number; fuel: number } | null>(null);
+  const wasInPitRef = useRef(false);
+  const pitTouchedSinceLastLapRef = useRef(false);
+
   // Simple Mode State
   const [isSimpleMode, setIsSimpleMode] = useState(false);
   const [showEmergency, setShowEmergency] = useState(false);
@@ -124,7 +132,16 @@ export default function App() {
     }
   }, []);
 
+  const accBridgeManualDisconnectRef = useRef(false);
+  const accBridgeReconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const connectAccBridgeRef = useRef<() => void>(() => {});
+
   const disconnectAccBridge = useCallback(() => {
+    accBridgeManualDisconnectRef.current = true;
+    if (accBridgeReconnectTimerRef.current) {
+      clearTimeout(accBridgeReconnectTimerRef.current);
+      accBridgeReconnectTimerRef.current = null;
+    }
     accBridgeSocketRef.current?.close();
     accBridgeSocketRef.current = null;
     setAccBridgeStatus('disconnected');
@@ -137,15 +154,68 @@ export default function App() {
       return;
     }
 
+    // --- ピット入退場の検知 ---
+    const inPitNow = !!(telemetry.isInPit || telemetry.isInPitLane);
+    if (inPitNow) {
+      // このピット滞在をまたぐ周は燃費サンプルとして使わない(給油で燃料が増えるため)
+      pitTouchedSinceLastLapRef.current = true;
+    }
+    if (wasInPitRef.current && !inPitNow) {
+      // ピットレーンを出た瞬間 = 想定外を含むピット作業の完了を検知
+      setPitExitPrompt({
+        lap: typeof telemetry.lap === 'number' ? telemetry.lap : '',
+        fuel: typeof telemetry.fuel === 'number' ? roundTo(telemetry.fuel, 1) : '',
+      });
+    }
+    wasInPitRef.current = inPitNow;
+
+    // --- 周回検知 + 1周ごとの実測燃費 ---
     if (typeof telemetry.lap === 'number' && Number.isFinite(telemetry.lap) && telemetry.lap >= 0) {
-      setCurrentLap(telemetry.lap);
+      const newLap = telemetry.lap;
+      const prevEdge = lastLapEdgeRef.current;
+      const fuelNow = typeof telemetry.fuel === 'number' && Number.isFinite(telemetry.fuel) ? telemetry.fuel : undefined;
+
+      if (prevEdge && newLap > prevEdge.lap) {
+        const lapsElapsed = newLap - prevEdge.lap;
+        if (fuelNow !== undefined && !pitTouchedSinceLastLapRef.current) {
+          const fuelUsedTotal = prevEdge.fuel - fuelNow;
+          // 給油等で燃料が減っていない(=正しく消費だけを捉えられた)場合のみ記録
+          if (fuelUsedTotal > 0) {
+            const perLap = roundTo(fuelUsedTotal / lapsElapsed, 2);
+            const nextHistory = [...lapFuelHistoryRef.current.slice(-7), { lap: newLap, fuelUsed: perLap }];
+            lapFuelHistoryRef.current = nextHistory;
+            setLapFuelHistory(nextHistory);
+
+            // 直近(最大3周)の実測平均を、レース全体平均より優先してfuelPerLapへ反映する
+            const recentSamples = nextHistory.slice(-3);
+            const avg = recentSamples.reduce((sum, e) => sum + e.fuelUsed, 0) / recentSamples.length;
+            setFuelPerLap(roundTo(avg, 2));
+          }
+        }
+        pitTouchedSinceLastLapRef.current = false;
+      } else if (prevEdge && newLap < prevEdge.lap) {
+        // セッションのリスタート等でラップが巻き戻った場合は履歴をリセット
+        lapFuelHistoryRef.current = [];
+        setLapFuelHistory([]);
+        pitTouchedSinceLastLapRef.current = false;
+      }
+
+      if (fuelNow !== undefined) {
+        lastLapEdgeRef.current = { lap: newLap, fuel: fuelNow };
+      }
+
+      setCurrentLap(newLap);
     }
 
     if (typeof telemetry.fuel === 'number' && Number.isFinite(telemetry.fuel) && telemetry.fuel >= 0) {
       setCurrentFuel(roundTo(telemetry.fuel, 1));
     }
 
-    if (typeof telemetry.fuelPerLap === 'number' && Number.isFinite(telemetry.fuelPerLap) && telemetry.fuelPerLap > 0) {
+    // 実測燃費の履歴がまだ無い(接続直後・レース序盤)場合のみ、ブリッジ側の累積推定値で代用する
+    if (
+      lapFuelHistoryRef.current.length === 0 &&
+      typeof telemetry.fuelPerLap === 'number' && Number.isFinite(telemetry.fuelPerLap) && telemetry.fuelPerLap > 0
+    ) {
       setFuelPerLap(roundTo(telemetry.fuelPerLap, 2));
     }
 
@@ -158,8 +228,18 @@ export default function App() {
     }
   }, []);
 
+  const confirmPitAsMandatory = useCallback(() => {
+    setCompletedMandatoryPits(prev => (Number(prev) || 0) + 1);
+    setPitExitPrompt(null);
+  }, []);
+
+  const dismissPitPrompt = useCallback(() => {
+    setPitExitPrompt(null);
+  }, []);
+
   const connectAccBridge = useCallback(() => {
     disconnectAccBridge();
+    accBridgeManualDisconnectRef.current = false;
     setAccBridgeStatus('connecting');
     setAccBridgeErrorMsg('');
 
@@ -193,6 +273,14 @@ export default function App() {
           accBridgeSocketRef.current = null;
           setAccBridgeStatus((status) => status === 'error' ? 'error' : 'disconnected');
         }
+
+        // 手動切断でなければ3秒後に自動再接続 (acc-app / ACC 再起動待ちに対応)
+        if (!accBridgeManualDisconnectRef.current) {
+          if (accBridgeReconnectTimerRef.current) clearTimeout(accBridgeReconnectTimerRef.current);
+          accBridgeReconnectTimerRef.current = setTimeout(() => {
+            connectAccBridgeRef.current();
+          }, 3000);
+        }
       };
     } catch (error) {
       console.error('ACC Bridge connection error:', error);
@@ -202,9 +290,18 @@ export default function App() {
   }, [accBridgeUrl, applyAccBridgeTelemetry, disconnectAccBridge]);
 
   useEffect(() => {
+    connectAccBridgeRef.current = connectAccBridge;
+  }, [connectAccBridge]);
+
+  useEffect(() => {
+    // 起動時に自動接続。C++ブリッジやACCがまだ起動していなくても3秒おきに自動で再試行する。
+    connectAccBridgeRef.current();
     return () => {
+      accBridgeManualDisconnectRef.current = true;
+      if (accBridgeReconnectTimerRef.current) clearTimeout(accBridgeReconnectTimerRef.current);
       accBridgeSocketRef.current?.close();
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
@@ -231,10 +328,10 @@ export default function App() {
         // http://localhost:8888/api/get-property-by-name?name=DataCorePlugin.GameData.CurrentLap
         
         // Let's use the direct property API to get what we need reliably:
-        const lapRes = await fetch(`${simHubUrl}/api/get-property-by-name?name=DataCorePlugin.GameData.CurrentLap`);
-        const fuelRes = await fetch(`${simHubUrl}/api/get-property-by-name?name=DataCorePlugin.GameData.Fuel`);
+        const lapRes = await fetch(`${simHubUrl}/api/get-property-by-name?name=DataCorePlugin.GameData.NewData.CurrentLap`);
+        const fuelRes = await fetch(`${simHubUrl}/api/get-property-by-name?name=DataCorePlugin.GameData.NewData.Fuel`);
         // Maybe rain?
-        const rainRes = await fetch(`${simHubUrl}/api/get-property-by-name?name=DataCorePlugin.GameData.TrackTemperature`);
+        const rainRes = await fetch(`${simHubUrl}/api/get-property-by-name?name=DataCorePlugin.GameData.NewData.TrackTemperature`);
         
         if (lapRes.ok) {
           const lapText = await lapRes.text();
@@ -267,7 +364,7 @@ export default function App() {
     if (!silent) setSimHubErrorMsg('');
     try {
       // Test connection
-      const res = await fetch(`${simHubUrl}/api/get-property-by-name?name=DataCorePlugin.GameData.CurrentLap`, {
+      const res = await fetch(`${simHubUrl}/api/get-property-by-name?name=DataCorePlugin.GameData.NewData.CurrentLap`, {
         method: 'GET',
         headers: { 'Accept': 'application/json' }
       });
@@ -659,6 +756,23 @@ export default function App() {
     isRaining
   ]);
 
+  // Fuel Engine: 現在のFuel/Fuel per Lapから「今すぐ使える情報」だけを算出する軽量レイヤー。
+  // results(スティント計画全体)とは別に、ライブ運用中に一目で見たい数値だけを独立して持たせる。
+  const fuelEngine = useMemo(() => {
+    const fuel = Number(currentFuel);
+    const fpl = Number(fuelPerLap);
+    if (!(fuel > 0) || !(fpl > 0)) return null;
+
+    const remainingLaps = fuel / fpl; // 今の燃料で走れる周回数
+    const lapsToFinish = results.isEmergency ? results.lapsToCover : null; // フィニッシュまでの残り周回数
+    const margin = lapsToFinish !== null ? remainingLaps - lapsToFinish : null; // 燃費余裕(+なら足りる)
+    const refuelNeeded = lapsToFinish !== null
+      ? Math.max(0, results.totalFuelNeededForCoverage - fuel)
+      : null;
+
+    return { fuel, fpl, remainingLaps, lapsToFinish, margin, refuelNeeded };
+  }, [currentFuel, fuelPerLap, results]);
+
   const renderEmergencyInput = () => (
     <div className={`bg-gradient-to-br from-slate-900 to-slate-950 border ${isSimpleMode ? 'border-yellow-900/40 p-4' : 'border-slate-800 p-6'} rounded-2xl shadow-xl space-y-4 relative overflow-hidden`}>
       {isSimpleMode && <div className="absolute top-0 left-0 w-1 h-full bg-yellow-500"></div>}
@@ -868,6 +982,105 @@ export default function App() {
           </div>
         </header>
 
+        {pitExitPrompt && (
+          <div className="bg-yellow-500/10 border border-yellow-500/40 rounded-2xl p-4 mb-4 sm:mb-6 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
+            <div className="flex items-start gap-3">
+              <AlertTriangle className="w-5 h-5 text-yellow-400 flex-shrink-0 mt-0.5" />
+              <div className="text-sm text-yellow-100">
+                <p className="font-bold text-yellow-400">ピット退出を検知しました{pitExitPrompt.lap !== '' ? `(Lap ${pitExitPrompt.lap})` : ''}</p>
+                <p className="text-xs text-yellow-200/80 mt-0.5">
+                  {pitExitPrompt.fuel !== '' ? `退出時燃料: ${pitExitPrompt.fuel}L / ` : ''}
+                  今のピットは義務ピットストップとしてカウントしますか？
+                </p>
+              </div>
+            </div>
+            <div className="flex gap-2 w-full sm:w-auto">
+              <button
+                onClick={confirmPitAsMandatory}
+                className="flex-1 sm:flex-none bg-yellow-500 hover:bg-yellow-400 text-slate-900 text-sm font-bold px-4 py-2 rounded-xl transition-colors whitespace-nowrap"
+              >
+                義務ピットとしてカウント
+              </button>
+              <button
+                onClick={dismissPitPrompt}
+                className="flex-1 sm:flex-none bg-slate-800 hover:bg-slate-700 text-slate-300 text-sm font-medium px-4 py-2 rounded-xl transition-colors whitespace-nowrap"
+              >
+                カウントしない
+              </button>
+            </div>
+          </div>
+        )}
+
+        {fuelEngine && (
+          <div className="bg-gradient-to-br from-slate-900 to-slate-950 border border-slate-800 rounded-2xl p-4 sm:p-6 mb-4 sm:mb-6">
+            <div className="flex items-center justify-between mb-3 sm:mb-4">
+              <h2 className="text-sm sm:text-base font-bold text-white flex items-center">
+                <Fuel className="w-4 h-4 sm:w-5 sm:h-5 mr-2 text-emerald-400" />
+                Fuel Engine
+              </h2>
+              {accBridgeStatus === 'connected' && (
+                <span className="flex items-center text-[10px] font-bold text-cyan-400 bg-cyan-500/10 border border-cyan-500/30 px-2 py-0.5 rounded-full">
+                  <span className="w-1.5 h-1.5 rounded-full bg-cyan-400 animate-pulse mr-1"></span>
+                  LIVE
+                </span>
+              )}
+            </div>
+            <div className="grid grid-cols-2 sm:grid-cols-5 gap-2 sm:gap-3">
+              <div className="bg-slate-950/60 rounded-xl p-3">
+                <div className="text-[11px] text-slate-500 mb-1">Fuel</div>
+                <div className="text-lg sm:text-2xl font-black text-white truncate">
+                  {fuelEngine.fuel.toFixed(1)}<span className="text-xs sm:text-sm text-slate-500 ml-0.5">L</span>
+                </div>
+              </div>
+              <div className="bg-slate-950/60 rounded-xl p-3">
+                <div className="text-[11px] text-slate-500 mb-1">Fuel/Lap</div>
+                <div className="text-lg sm:text-2xl font-black text-white truncate">
+                  {fuelEngine.fpl.toFixed(2)}<span className="text-xs sm:text-sm text-slate-500 ml-0.5">L</span>
+                </div>
+              </div>
+              <div className="bg-slate-950/60 rounded-xl p-3">
+                <div className="text-[11px] text-slate-500 mb-1">Remaining</div>
+                <div className="text-lg sm:text-2xl font-black text-white truncate">
+                  {fuelEngine.remainingLaps.toFixed(2)}<span className="text-xs sm:text-sm text-slate-500 ml-0.5">Lap</span>
+                </div>
+              </div>
+              {fuelEngine.lapsToFinish !== null ? (
+                <div className="bg-slate-950/60 rounded-xl p-3">
+                  <div className="text-[11px] text-slate-500 mb-1">Finish</div>
+                  <div className="text-lg sm:text-2xl font-black text-white truncate">
+                    {fuelEngine.lapsToFinish}<span className="text-xs sm:text-sm text-slate-500 ml-0.5">Lap</span>
+                  </div>
+                </div>
+              ) : (
+                <div className="bg-slate-950/60 rounded-xl p-3 flex items-center justify-center text-center">
+                  <div className="text-[11px] text-slate-600">Lap未検出</div>
+                </div>
+              )}
+              {fuelEngine.margin !== null ? (
+                <div className={`rounded-xl p-3 border ${fuelEngine.margin < 0 ? 'bg-red-500/10 border-red-500/40' : 'bg-emerald-500/10 border-emerald-500/30'}`}>
+                  <div className={`text-[11px] mb-1 ${fuelEngine.margin < 0 ? 'text-red-400' : 'text-emerald-400'}`}>Margin</div>
+                  <div className={`text-lg sm:text-2xl font-black truncate ${fuelEngine.margin < 0 ? 'text-red-400' : 'text-emerald-400'}`}>
+                    {fuelEngine.margin >= 0 ? '+' : ''}{fuelEngine.margin.toFixed(2)}<span className="text-xs sm:text-sm ml-0.5 opacity-70">Lap</span>
+                  </div>
+                </div>
+              ) : (
+                <div className="bg-slate-950/60 rounded-xl p-3 flex items-center justify-center text-center">
+                  <div className="text-[11px] text-slate-600">Lap未検出</div>
+                </div>
+              )}
+            </div>
+            {fuelEngine.margin !== null && fuelEngine.margin < 0 && (
+              <div className="mt-3 bg-red-500/10 border border-red-500/40 rounded-xl p-3 text-red-400 text-xs sm:text-sm font-bold flex items-start sm:items-center">
+                <AlertTriangle className="w-4 h-4 mr-2 flex-shrink-0 mt-0.5 sm:mt-0" />
+                <span>
+                  現在の燃費のままではフィニッシュまで燃料が持ちません({Math.abs(fuelEngine.margin).toFixed(2)}Lap不足)。
+                  {fuelEngine.refuelNeeded ? `次のピットで最低 ${Math.ceil(fuelEngine.refuelNeeded)}L の給油が必要です。` : ''}
+                </span>
+              </div>
+            )}
+          </div>
+        )}
+
         {!isSimpleMode && (
           <div className="bg-slate-900/50 border border-slate-800 rounded-2xl p-3 sm:p-6 mb-4 sm:mb-6 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
             <div className="flex flex-wrap items-center gap-2 text-slate-300 w-full sm:w-auto">
@@ -976,6 +1189,12 @@ export default function App() {
                       />
                       <span className="absolute right-4 top-3 text-slate-500 font-medium">L</span>
                     </div>
+                    {lapFuelHistory.length > 0 && (
+                      <p className="text-[11px] text-cyan-400 flex items-center gap-1">
+                        <span className="w-1.5 h-1.5 rounded-full bg-cyan-400 animate-pulse"></span>
+                        直近{Math.min(3, lapFuelHistory.length)}周の実測平均を自動反映中 (最新Lap{lapFuelHistory[lapFuelHistory.length - 1].lap}: {lapFuelHistory[lapFuelHistory.length - 1].fuelUsed}L)
+                      </p>
+                    )}
                   </div>
 
                   {/* Lap Time */}
