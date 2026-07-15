@@ -787,6 +787,7 @@ export default function App() {
     return {
       isEmergency,
       isRaining,
+      raceLaps,
       totalLaps,
       lapsToCover,
       totalFuel,
@@ -827,19 +828,26 @@ export default function App() {
     const fpl = Number(fuelPerLap);
     if (!(fuel > 0) || !(fpl > 0)) return null;
 
+    const cLap = Number(currentLap) || 0;
     const reserve = Math.max(0, Number(minReserveFuel) || 0);
     const usableFuel = Math.max(0, fuel - reserve); // 最低残燃料を除いた「使える」燃料
     const remainingLaps = usableFuel / fpl; // 今の燃料(予備を除く)で走れる周回数
-    const lapsToFinish = results.isEmergency ? results.lapsToCover : null; // フィニッシュまでの残り周回数
+
+    // 「フィニッシュまでの残り周回数」はextraLaps(事前計画のバッファ)を含まない
+    // 実際のレース距離(raceLaps)を基準にする。totalLaps(=raceLaps+extraLaps)を使うと
+    // extraLapsとsafetyMarginLapsという2つのバッファが二重に効いてしまうため。
+    const lapsToFinish = results.isEmergency ? Math.max(0, results.raceLaps - cLap) : null;
     const margin = lapsToFinish !== null ? remainingLaps - lapsToFinish : null; // 燃費余裕(+なら足りる)
     const marginThreshold = Number(safetyMarginLaps) || 0;
     const isLow = alertsEnabled && margin !== null && margin < marginThreshold;
-    const refuelNeeded = lapsToFinish !== null
+
+    // 給油量の目安は事前計画のバッファ(extraLaps)込みで案内する(安全側)
+    const refuelNeeded = results.isEmergency
       ? Math.max(0, (results.totalFuelNeededForCoverage + reserve) - fuel)
       : null;
 
     return { fuel, fpl, remainingLaps, lapsToFinish, margin, refuelNeeded, isLow, marginThreshold };
-  }, [currentFuel, fuelPerLap, results, minReserveFuel, safetyMarginLaps, alertsEnabled]);
+  }, [currentFuel, fuelPerLap, currentLap, results, minReserveFuel, safetyMarginLaps, alertsEnabled]);
 
   // Weather Engine: trackGripStatus(0-6: Green/Fast/Optimum/Greasy/Damp/Wet/Flooded)を
   // Dry/Damp/Wet/Heavy Wetの4段階に単純化し、ACCが持つ10分/30分先の雨量予報からトレンドを出す。
