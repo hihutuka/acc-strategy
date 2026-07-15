@@ -17,6 +17,10 @@ interface Preset {
   pitLossTime?: number | '';
   tireChangeTime?: number | '';
   refuelTimePerL?: number | '';
+  safetyMarginLaps?: number | '';
+  minReserveFuel?: number | '';
+  tyrePressureMin?: number | '';
+  tyrePressureMax?: number | '';
   extraLaps: number | '';
   strategyType: 'equal' | 'full';
 }
@@ -34,8 +38,19 @@ interface AccBridgeTelemetry {
   bestLapTime?: string;
   isInPit?: boolean;
   isInPitLane?: boolean;
+  flag?: number;
   rainIntensity?: number;
   trackGripStatus?: number;
+  idealLineGrip?: number;
+  rainIntensityIn10min?: number;
+  rainIntensityIn30min?: number;
+  roadTemp?: number;
+  tyrePressure?: number[];
+  tyreWear?: number[];
+  tyreTemp?: number[];
+  sessionType?: number;
+  sessionTimeLeft?: number;
+  numberOfLaps?: number;
   trackLength?: number;
   maxFuel?: number;
   connected?: boolean;
@@ -56,6 +71,40 @@ const roundTo = (value: number, digits: number) => {
   const scale = 10 ** digits;
   return Math.round(value * scale) / scale;
 };
+
+// ACCのtrackGripStatus (0-6) のラベル。数値の並びはACCの標準スケールに準拠。
+const TRACK_GRIP_LABELS = ['Green', 'Fast', 'Optimum', 'Greasy', 'Damp', 'Wet', 'Flooded'];
+
+// ACCのflag (AC_FLAG_TYPE, 0-6) を「今すべきこと」に翻訳するテーブル。
+// Green/Redは共有メモリのflagに直接対応する値が無いため、Noneを「クリア(Green相当)」として扱う。
+const FLAG_INFO: Record<number, { label: string; advice: string; tone: 'neutral' | 'caution' | 'danger' | 'info' }> = {
+  0: { label: 'クリア (No Flag)', advice: '通常走行', tone: 'neutral' },
+  1: { label: 'ブルーフラッグ', advice: '後方に速い車。道を譲ってください', tone: 'info' },
+  2: { label: 'イエローフラッグ', advice: 'オーバーテイク禁止。燃費セーブのチャンス', tone: 'caution' },
+  3: { label: 'ブラックフラッグ', advice: 'ピットイン指示の可能性があります', tone: 'danger' },
+  4: { label: 'ホワイトフラッグ', advice: '低速車が前方にいます。注意', tone: 'caution' },
+  5: { label: 'チェッカーフラッグ', advice: 'セッション終了', tone: 'info' },
+  6: { label: 'ペナルティフラッグ', advice: 'ペナルティが課されています', tone: 'danger' },
+};
+
+// ACCのAC_SESSION_TYPE (-1=Unknown,0=Practice,1=Qualify,2=Race,3=Hotlap,4=TimeAttack,5=Drift,6=Drag)
+const SESSION_TYPE_LABELS: Record<number, string> = {
+  [-1]: 'Unknown',
+  0: 'Practice',
+  1: 'Qualify',
+  2: 'Race',
+  3: 'Hotlap',
+  4: 'Time Attack',
+  5: 'Drift',
+  6: 'Drag',
+};
+
+// タイヤ温度・摩耗の判定しきい値(GT3一般的な目安。車種により異なるため参考値)
+const TYRE_TEMP_COLD_MAX = 70; // これ未満: Cold
+const TYRE_TEMP_HOT_MAX = 100; // これ以下: Optimal, 超えたらOverheated
+const TYRE_WEAR_CAUTION = 15; // %, これ以上でCaution
+const TYRE_WEAR_REPLACE = 30; // %, これ以上でReplace(ACC仕様: 0=新品,100=完全摩耗)
+const TYRE_LABELS = ['FL', 'FR', 'RL', 'RR'];
 
 export default function App() {
   const [raceDuration, setRaceDuration] = useState<number | ''>(60);
@@ -78,6 +127,13 @@ export default function App() {
   const [pitLossTime, setPitLossTime] = useState<number | ''>(30);
   const [tireChangeTime, setTireChangeTime] = useState<number | ''>(30);
   const [refuelTimePerL, setRefuelTimePerL] = useState<number | ''>(0.2);
+
+  // Alert & Safety Settings (④ 設定画面)
+  const [safetyMarginLaps, setSafetyMarginLaps] = useState<number | ''>(1.0);
+  const [minReserveFuel, setMinReserveFuel] = useState<number | ''>(0);
+  const [alertsEnabled, setAlertsEnabled] = useState<boolean>(true);
+  const [tyrePressureMin, setTyrePressureMin] = useState<number | ''>(26.5);
+  const [tyrePressureMax, setTyrePressureMax] = useState<number | ''>(27.5);
 
   // Emergency States
   const [currentLap, setCurrentLap] = useState<number | ''>('');
@@ -410,6 +466,10 @@ export default function App() {
       pitLossTime,
       tireChangeTime,
       refuelTimePerL,
+      safetyMarginLaps,
+      minReserveFuel,
+      tyrePressureMin,
+      tyrePressureMax,
       extraLaps,
       strategyType
     };
@@ -434,6 +494,10 @@ export default function App() {
     setPitLossTime(preset.pitLossTime !== undefined ? preset.pitLossTime : 30);
     setTireChangeTime(preset.tireChangeTime !== undefined ? preset.tireChangeTime : 30);
     setRefuelTimePerL(preset.refuelTimePerL !== undefined ? preset.refuelTimePerL : 0.2);
+    setSafetyMarginLaps(preset.safetyMarginLaps !== undefined ? preset.safetyMarginLaps : 1.0);
+    setMinReserveFuel(preset.minReserveFuel !== undefined ? preset.minReserveFuel : 0);
+    setTyrePressureMin(preset.tyrePressureMin !== undefined ? preset.tyrePressureMin : 26.5);
+    setTyrePressureMax(preset.tyrePressureMax !== undefined ? preset.tyrePressureMax : 27.5);
     setExtraLaps(preset.extraLaps);
     setStrategyType(preset.strategyType || 'equal');
   };
@@ -763,15 +827,110 @@ export default function App() {
     const fpl = Number(fuelPerLap);
     if (!(fuel > 0) || !(fpl > 0)) return null;
 
-    const remainingLaps = fuel / fpl; // 今の燃料で走れる周回数
+    const reserve = Math.max(0, Number(minReserveFuel) || 0);
+    const usableFuel = Math.max(0, fuel - reserve); // 最低残燃料を除いた「使える」燃料
+    const remainingLaps = usableFuel / fpl; // 今の燃料(予備を除く)で走れる周回数
     const lapsToFinish = results.isEmergency ? results.lapsToCover : null; // フィニッシュまでの残り周回数
     const margin = lapsToFinish !== null ? remainingLaps - lapsToFinish : null; // 燃費余裕(+なら足りる)
+    const marginThreshold = Number(safetyMarginLaps) || 0;
+    const isLow = alertsEnabled && margin !== null && margin < marginThreshold;
     const refuelNeeded = lapsToFinish !== null
-      ? Math.max(0, results.totalFuelNeededForCoverage - fuel)
+      ? Math.max(0, (results.totalFuelNeededForCoverage + reserve) - fuel)
       : null;
 
-    return { fuel, fpl, remainingLaps, lapsToFinish, margin, refuelNeeded };
-  }, [currentFuel, fuelPerLap, results]);
+    return { fuel, fpl, remainingLaps, lapsToFinish, margin, refuelNeeded, isLow, marginThreshold };
+  }, [currentFuel, fuelPerLap, results, minReserveFuel, safetyMarginLaps, alertsEnabled]);
+
+  // Weather Engine: trackGripStatus(0-6: Green/Fast/Optimum/Greasy/Damp/Wet/Flooded)を
+  // Dry/Damp/Wet/Heavy Wetの4段階に単純化し、ACCが持つ10分/30分先の雨量予報からトレンドを出す。
+  const weatherEngine = useMemo(() => {
+    const t = accBridgeTelemetry;
+    if (!t || t.connected === false || typeof t.trackGripStatus !== 'number') return null;
+
+    const gripIndex = Math.max(0, Math.min(6, Math.round(t.trackGripStatus)));
+    const gripLabel = TRACK_GRIP_LABELS[gripIndex] ?? '不明';
+
+    let condition: 'Dry' | 'Damp' | 'Wet' | 'Heavy Wet';
+    if (gripIndex <= 2) condition = 'Dry';
+    else if (gripIndex <= 4) condition = 'Damp';
+    else if (gripIndex === 5) condition = 'Wet';
+    else condition = 'Heavy Wet';
+
+    const now = typeof t.rainIntensity === 'number' ? t.rainIntensity : null;
+    const in10 = typeof t.rainIntensityIn10min === 'number' ? t.rainIntensityIn10min : null;
+    const in30 = typeof t.rainIntensityIn30min === 'number' ? t.rainIntensityIn30min : null;
+
+    let trend: 'increasing' | 'drying' | 'steady' | null = null;
+    if (now !== null && in10 !== null) {
+      if (in10 > now) trend = 'increasing';
+      else if (in10 < now) trend = 'drying';
+      else trend = 'steady';
+    }
+
+    return {
+      gripIndex,
+      gripLabel,
+      condition,
+      rainNow: now,
+      rainIn10: in10,
+      rainIn30: in30,
+      trend,
+      roadTemp: typeof t.roadTemp === 'number' ? t.roadTemp : null,
+    };
+  }, [accBridgeTelemetry]);
+
+  // Race Control: ACCのflag(0-6)を、そのまま「今すべきこと」に翻訳する。
+  const raceControl = useMemo(() => {
+    const t = accBridgeTelemetry;
+    if (!t || t.connected === false || typeof t.flag !== 'number') return null;
+    const info = FLAG_INFO[t.flag] ?? { label: `不明 (${t.flag})`, advice: '', tone: 'neutral' as const };
+    return { flag: t.flag, ...info };
+  }, [accBridgeTelemetry]);
+
+  // Tyre Engine: 4輪の空気圧・摩耗・温度を判定し、最も状態の悪いコーナーで全体ステータスを決める
+  const tyreEngine = useMemo(() => {
+    const t = accBridgeTelemetry;
+    if (!t || t.connected === false || !Array.isArray(t.tyrePressure) || !Array.isArray(t.tyreTemp) || !Array.isArray(t.tyreWear)) {
+      return null;
+    }
+    const pMin = Number(tyrePressureMin) || 0;
+    const pMax = Number(tyrePressureMax) || Infinity;
+
+    const corners = TYRE_LABELS.map((label, i) => {
+      const pressure = t.tyrePressure?.[i] ?? 0;
+      const temp = t.tyreTemp?.[i] ?? 0;
+      const wear = t.tyreWear?.[i] ?? 0;
+
+      let status: 'Optimal' | 'Cold' | 'Overheated' | 'Replace' = 'Optimal';
+      if (wear >= TYRE_WEAR_REPLACE) status = 'Replace';
+      else if (temp > TYRE_TEMP_HOT_MAX) status = 'Overheated';
+      else if (temp < TYRE_TEMP_COLD_MAX) status = 'Cold';
+      else if (pressure < pMin || pressure > pMax) status = 'Cold'; // 圧力レンジ外れも要注意扱い
+
+      return { label, pressure, temp, wear, status };
+    });
+
+    const severity = { Optimal: 0, Cold: 1, Overheated: 2, Replace: 3 } as const;
+    const worst = corners.reduce((a, b) => (severity[b.status] > severity[a.status] ? b : a));
+
+    return { corners, overallStatus: worst.status, wearCaution: corners.some(c => c.wear >= TYRE_WEAR_CAUTION) };
+  }, [accBridgeTelemetry, tyrePressureMin, tyrePressureMax]);
+
+  // Session Engine
+  const sessionEngine = useMemo(() => {
+    const t = accBridgeTelemetry;
+    if (!t || t.connected === false || typeof t.sessionType !== 'number') return null;
+    const label = SESSION_TYPE_LABELS[t.sessionType] ?? `Unknown(${t.sessionType})`;
+    const timeLeftSec = typeof t.sessionTimeLeft === 'number' ? Math.max(0, Math.round(t.sessionTimeLeft)) : null;
+    const mm = timeLeftSec !== null ? Math.floor(timeLeftSec / 60) : null;
+    const ss = timeLeftSec !== null ? timeLeftSec % 60 : null;
+    return {
+      label,
+      timeLeftSec,
+      timeLeftDisplay: mm !== null && ss !== null ? `${mm}:${String(ss).padStart(2, '0')}` : null,
+      numberOfLaps: typeof t.numberOfLaps === 'number' && t.numberOfLaps > 0 ? t.numberOfLaps : null,
+    };
+  }, [accBridgeTelemetry]);
 
   const renderEmergencyInput = () => (
     <div className={`bg-gradient-to-br from-slate-900 to-slate-950 border ${isSimpleMode ? 'border-yellow-900/40 p-4' : 'border-slate-800 p-6'} rounded-2xl shadow-xl space-y-4 relative overflow-hidden`}>
@@ -1057,9 +1216,9 @@ export default function App() {
                 </div>
               )}
               {fuelEngine.margin !== null ? (
-                <div className={`rounded-xl p-3 border ${fuelEngine.margin < 0 ? 'bg-red-500/10 border-red-500/40' : 'bg-emerald-500/10 border-emerald-500/30'}`}>
-                  <div className={`text-[11px] mb-1 ${fuelEngine.margin < 0 ? 'text-red-400' : 'text-emerald-400'}`}>Margin</div>
-                  <div className={`text-lg sm:text-2xl font-black truncate ${fuelEngine.margin < 0 ? 'text-red-400' : 'text-emerald-400'}`}>
+                <div className={`rounded-xl p-3 border ${fuelEngine.isLow ? 'bg-red-500/10 border-red-500/40' : 'bg-emerald-500/10 border-emerald-500/30'}`}>
+                  <div className={`text-[11px] mb-1 ${fuelEngine.isLow ? 'text-red-400' : 'text-emerald-400'}`}>Margin</div>
+                  <div className={`text-lg sm:text-2xl font-black truncate ${fuelEngine.isLow ? 'text-red-400' : 'text-emerald-400'}`}>
                     {fuelEngine.margin >= 0 ? '+' : ''}{fuelEngine.margin.toFixed(2)}<span className="text-xs sm:text-sm ml-0.5 opacity-70">Lap</span>
                   </div>
                 </div>
@@ -1069,13 +1228,146 @@ export default function App() {
                 </div>
               )}
             </div>
-            {fuelEngine.margin !== null && fuelEngine.margin < 0 && (
+            {fuelEngine.isLow && fuelEngine.margin !== null && (
               <div className="mt-3 bg-red-500/10 border border-red-500/40 rounded-xl p-3 text-red-400 text-xs sm:text-sm font-bold flex items-start sm:items-center">
                 <AlertTriangle className="w-4 h-4 mr-2 flex-shrink-0 mt-0.5 sm:mt-0" />
                 <span>
-                  現在の燃費のままではフィニッシュまで燃料が持ちません({Math.abs(fuelEngine.margin).toFixed(2)}Lap不足)。
+                  {fuelEngine.margin < 0
+                    ? `現在の燃費のままではフィニッシュまで燃料が持ちません(${Math.abs(fuelEngine.margin).toFixed(2)}Lap不足)。`
+                    : `安全マージン(${fuelEngine.marginThreshold.toFixed(1)}Lap)を下回っています(残り${fuelEngine.margin.toFixed(2)}Lap分)。`}
                   {fuelEngine.refuelNeeded ? `次のピットで最低 ${Math.ceil(fuelEngine.refuelNeeded)}L の給油が必要です。` : ''}
                 </span>
+              </div>
+            )}
+          </div>
+        )}
+
+        {(weatherEngine || raceControl) && (
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-4 sm:mb-6">
+            {weatherEngine && (
+              <div className="bg-gradient-to-br from-slate-900 to-slate-950 border border-slate-800 rounded-2xl p-4 sm:p-6">
+                <div className="flex items-center justify-between mb-3">
+                  <h2 className="text-sm sm:text-base font-bold text-white flex items-center">
+                    <CloudRain className="w-4 h-4 sm:w-5 sm:h-5 mr-2 text-sky-400" />
+                    Weather Engine
+                  </h2>
+                  <span className={`text-xs font-bold px-2.5 py-1 rounded-full border ${
+                    weatherEngine.condition === 'Dry' ? 'text-emerald-400 border-emerald-500/30 bg-emerald-500/10' :
+                    weatherEngine.condition === 'Damp' ? 'text-yellow-400 border-yellow-500/30 bg-yellow-500/10' :
+                    weatherEngine.condition === 'Wet' ? 'text-orange-400 border-orange-500/30 bg-orange-500/10' :
+                    'text-red-400 border-red-500/30 bg-red-500/10'
+                  }`}>
+                    {weatherEngine.condition}
+                  </span>
+                </div>
+                <div className="grid grid-cols-2 gap-2 text-sm">
+                  <div className="bg-slate-950/60 rounded-xl p-2.5">
+                    <div className="text-[11px] text-slate-500">Track Grip</div>
+                    <div className="text-white font-bold">{weatherEngine.gripLabel}</div>
+                  </div>
+                  <div className="bg-slate-950/60 rounded-xl p-2.5">
+                    <div className="text-[11px] text-slate-500">Road Temp</div>
+                    <div className="text-white font-bold">{weatherEngine.roadTemp !== null ? `${weatherEngine.roadTemp.toFixed(1)}°C` : '-'}</div>
+                  </div>
+                </div>
+                {weatherEngine.trend && (
+                  <div className={`mt-2 text-xs font-medium flex items-center gap-1 ${
+                    weatherEngine.trend === 'increasing' ? 'text-red-400' :
+                    weatherEngine.trend === 'drying' ? 'text-emerald-400' : 'text-slate-400'
+                  }`}>
+                    {weatherEngine.trend === 'increasing' && <>▲ Rain Increasing (10分後の予報が悪化)</>}
+                    {weatherEngine.trend === 'drying' && <>▼ Drying (10分後の予報が回復)</>}
+                    {weatherEngine.trend === 'steady' && <>→ Steady</>}
+                  </div>
+                )}
+              </div>
+            )}
+
+            {raceControl && (
+              <div className="bg-gradient-to-br from-slate-900 to-slate-950 border border-slate-800 rounded-2xl p-4 sm:p-6">
+                <h2 className="text-sm sm:text-base font-bold text-white flex items-center mb-3">
+                  <Flag className="w-4 h-4 sm:w-5 sm:h-5 mr-2 text-slate-400" />
+                  Race Control
+                </h2>
+                <div className={`rounded-xl p-3 border ${
+                  raceControl.tone === 'danger' ? 'bg-red-500/10 border-red-500/40' :
+                  raceControl.tone === 'caution' ? 'bg-yellow-500/10 border-yellow-500/40' :
+                  raceControl.tone === 'info' ? 'bg-blue-500/10 border-blue-500/40' :
+                  'bg-slate-950/60 border-slate-800'
+                }`}>
+                  <div className={`font-bold text-sm sm:text-base ${
+                    raceControl.tone === 'danger' ? 'text-red-400' :
+                    raceControl.tone === 'caution' ? 'text-yellow-400' :
+                    raceControl.tone === 'info' ? 'text-blue-400' : 'text-white'
+                  }`}>
+                    {raceControl.label}
+                  </div>
+                  {raceControl.advice && (
+                    <div className="text-xs sm:text-sm text-slate-300 mt-1">{raceControl.advice}</div>
+                  )}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {(tyreEngine || sessionEngine) && (
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-4 sm:mb-6">
+            {tyreEngine && (
+              <div className="bg-gradient-to-br from-slate-900 to-slate-950 border border-slate-800 rounded-2xl p-4 sm:p-6">
+                <div className="flex items-center justify-between mb-3">
+                  <h2 className="text-sm sm:text-base font-bold text-white flex items-center">
+                    <Gauge className="w-4 h-4 sm:w-5 sm:h-5 mr-2 text-purple-400" />
+                    Tyre Engine
+                  </h2>
+                  <span className={`text-xs font-bold px-2.5 py-1 rounded-full border ${
+                    tyreEngine.overallStatus === 'Optimal' ? 'text-emerald-400 border-emerald-500/30 bg-emerald-500/10' :
+                    tyreEngine.overallStatus === 'Replace' ? 'text-red-400 border-red-500/30 bg-red-500/10' :
+                    'text-yellow-400 border-yellow-500/30 bg-yellow-500/10'
+                  }`}>
+                    {tyreEngine.overallStatus}
+                  </span>
+                </div>
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                  {tyreEngine.corners.map((c) => (
+                    <div key={c.label} className="bg-slate-950/60 rounded-xl p-2 text-center">
+                      <div className="text-[11px] text-slate-500 mb-1">{c.label}</div>
+                      <div className={`text-sm font-bold ${
+                        c.status === 'Optimal' ? 'text-emerald-400' :
+                        c.status === 'Replace' ? 'text-red-400' : 'text-yellow-400'
+                      }`}>
+                        {c.temp.toFixed(0)}°C
+                      </div>
+                      <div className="text-[10px] text-slate-500">{c.pressure.toFixed(1)}psi</div>
+                      <div className="text-[10px] text-slate-500">摩耗 {c.wear.toFixed(0)}%</div>
+                    </div>
+                  ))}
+                </div>
+                {tyreEngine.wearCaution && (
+                  <p className="text-[11px] text-yellow-400 mt-2">摩耗が進んでいるタイヤがあります(目安{TYRE_WEAR_CAUTION}%以上)。</p>
+                )}
+              </div>
+            )}
+
+            {sessionEngine && (
+              <div className="bg-gradient-to-br from-slate-900 to-slate-950 border border-slate-800 rounded-2xl p-4 sm:p-6">
+                <h2 className="text-sm sm:text-base font-bold text-white flex items-center mb-3">
+                  <Clock className="w-4 h-4 sm:w-5 sm:h-5 mr-2 text-slate-400" />
+                  Session Engine
+                </h2>
+                <div className="grid grid-cols-2 gap-2">
+                  <div className="bg-slate-950/60 rounded-xl p-2.5">
+                    <div className="text-[11px] text-slate-500">Session</div>
+                    <div className="text-white font-bold">{sessionEngine.label}</div>
+                  </div>
+                  <div className="bg-slate-950/60 rounded-xl p-2.5">
+                    <div className="text-[11px] text-slate-500">残り時間</div>
+                    <div className="text-white font-bold font-mono">{sessionEngine.timeLeftDisplay ?? '-'}</div>
+                  </div>
+                </div>
+                {sessionEngine.numberOfLaps && (
+                  <p className="text-[11px] text-slate-400 mt-2">周回数ベースのセッション: 全{sessionEngine.numberOfLaps}周</p>
+                )}
               </div>
             )}
           </div>
@@ -1417,6 +1709,58 @@ export default function App() {
                         </div>
                       </div>
                     </div>
+                  </div>
+
+                  {/* Alert & Safety Settings */}
+                  <div className="space-y-4 sm:col-span-2 p-4 border border-slate-800 bg-slate-950/50 rounded-xl">
+                    <div className="flex items-center justify-between">
+                      <h3 className="text-sm font-semibold text-slate-300 flex items-center">
+                        <AlertTriangle className="w-4 h-4 mr-2" />
+                        アラート・安全設定
+                      </h3>
+                      <label className="flex items-center gap-2 cursor-pointer">
+                        <span className="text-xs text-slate-400">アラート</span>
+                        <input
+                          type="checkbox"
+                          checked={alertsEnabled}
+                          onChange={(e) => setAlertsEnabled(e.target.checked)}
+                          className="w-4 h-4 rounded border-slate-700 text-red-500 focus:ring-red-500 bg-slate-900"
+                        />
+                      </label>
+                    </div>
+                    <div className="grid grid-cols-1 sm:grid-cols-4 gap-4">
+                      <div className="space-y-1">
+                        <label className="text-xs text-slate-400">安全マージン</label>
+                        <div className="relative">
+                          <input type="number" step="0.1" min="0" value={safetyMarginLaps} onChange={(e) => setSafetyMarginLaps(e.target.value ? Number(e.target.value) : '')} className="w-full bg-slate-900 border border-slate-700 rounded-lg py-2 px-3 text-sm text-white" />
+                          <span className="absolute right-3 top-2 text-slate-500 text-xs">Lap</span>
+                        </div>
+                      </div>
+                      <div className="space-y-1">
+                        <label className="text-xs text-slate-400">最低残燃料</label>
+                        <div className="relative">
+                          <input type="number" step="0.5" min="0" value={minReserveFuel} onChange={(e) => setMinReserveFuel(e.target.value ? Number(e.target.value) : '')} className="w-full bg-slate-900 border border-slate-700 rounded-lg py-2 px-3 text-sm text-white" />
+                          <span className="absolute right-3 top-2 text-slate-500 text-xs">L</span>
+                        </div>
+                      </div>
+                      <div className="space-y-1">
+                        <label className="text-xs text-slate-400">タイヤ空気圧 (下限)</label>
+                        <div className="relative">
+                          <input type="number" step="0.1" value={tyrePressureMin} onChange={(e) => setTyrePressureMin(e.target.value ? Number(e.target.value) : '')} className="w-full bg-slate-900 border border-slate-700 rounded-lg py-2 px-3 text-sm text-white" />
+                          <span className="absolute right-3 top-2 text-slate-500 text-xs">psi</span>
+                        </div>
+                      </div>
+                      <div className="space-y-1">
+                        <label className="text-xs text-slate-400">タイヤ空気圧 (上限)</label>
+                        <div className="relative">
+                          <input type="number" step="0.1" value={tyrePressureMax} onChange={(e) => setTyrePressureMax(e.target.value ? Number(e.target.value) : '')} className="w-full bg-slate-900 border border-slate-700 rounded-lg py-2 px-3 text-sm text-white" />
+                          <span className="absolute right-3 top-2 text-slate-500 text-xs">psi</span>
+                        </div>
+                      </div>
+                    </div>
+                    <p className="text-[11px] text-slate-500">
+                      安全マージン・最低残燃料はFuel Engineの警告判定に使われます。タイヤ空気圧はドライGT3の一般的な目安値です(車種により調整してください)。
+                    </p>
                   </div>
 
                   {/* Strategy Type */}
