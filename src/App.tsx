@@ -51,6 +51,7 @@ interface AccBridgeTelemetry {
   sessionType?: number;
   sessionTimeLeft?: number;
   numberOfLaps?: number;
+  missingMandatoryPits?: number;
   trackLength?: number;
   maxFuel?: number;
   connected?: boolean;
@@ -134,6 +135,10 @@ export default function App() {
   const [alertsEnabled, setAlertsEnabled] = useState<boolean>(true);
   const [tyrePressureMin, setTyrePressureMin] = useState<number | ''>(26.5);
   const [tyrePressureMax, setTyrePressureMax] = useState<number | ''>(27.5);
+
+  // ACCから自動検出した値(手動入力を上書きする、レース開始前に読み取れる情報)
+  const [autoTotalLaps, setAutoTotalLaps] = useState<number | null>(null);
+  const mandatoryPitsBaselineRef = useRef<number | null>(null);
 
   // Emergency States
   const [currentLap, setCurrentLap] = useState<number | ''>('');
@@ -2374,5 +2379,3 @@ export default function App() {
     </div>
   );
 }
-
-
