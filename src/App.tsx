@@ -66,38 +66,68 @@ interface AccBridgeFrame {
   };
 }
 
-const DEFAULT_ACC_BRIDGE_URL = 'ws://localhost:8081';
+// localhostで開いていればws://localhost:8081、PCのLAN IP経由(スマホ等)で開いていれば
+// そのIPを自動的に使う。手動でURLを変えた場合はlocalStorageの値が優先される。
+function getDefaultAccBridgeUrl(): string {
+  if (typeof window !== 'undefined' && window.location.hostname
+    && window.location.hostname !== 'localhost' && window.location.hostname !== '127.0.0.1') {
+    return `ws://${window.location.hostname}:8081`;
+  }
+  return 'ws://localhost:8081';
+}
 
 const roundTo = (value: number, digits: number) => {
   const scale = 10 ** digits;
   return Math.round(value * scale) / scale;
 };
 
-// ACCのtrackGripStatus (0-6) のラベル。数値の並びはACCの標準スケールに準拠。
-const TRACK_GRIP_LABELS = ['Green', 'Fast', 'Optimum', 'Greasy', 'Damp', 'Wet', 'Flooded'];
+// ACCのラップタイム文字列("1:23.456" "1:23:456" "83.456" 等の揺れに対応)を秒数に変換
+function parseLapTimeToSeconds(text: string | undefined): number | null {
+  if (!text) return null;
+  const trimmed = text.trim();
+  if (!trimmed) return null;
+  const withMinutes = trimmed.match(/^(\d+):(\d{1,2})[.:](\d{1,3})$/);
+  if (withMinutes) {
+    const [, mm, ss, ms] = withMinutes;
+    const total = Number(mm) * 60 + Number(ss) + Number(ms.padEnd(3, '0')) / 1000;
+    return total > 0 ? total : null;
+  }
+  const secondsOnly = trimmed.match(/^(\d+)[.:](\d{1,3})$/);
+  if (secondsOnly) {
+    const [, ss, ms] = secondsOnly;
+    const total = Number(ss) + Number(ms.padEnd(3, '0')) / 1000;
+    return total > 0 ? total : null;
+  }
+  return null;
+}
 
-// ACCのflag (AC_FLAG_TYPE, 0-6) を「今すべきこと」に翻訳するテーブル。
-// Green/Redは共有メモリのflagに直接対応する値が無いため、Noneを「クリア(Green相当)」として扱う。
+// ACCのtrackGripStatus (0-6) のラベル。数値の並びはACCの標準スケールに準拠。
+const TRACK_GRIP_LABELS = ['グリーン', '高速', '最適', 'やや荒れ', 'やや濡れ', 'ウェット', '冠水'];
+
+// ACCのflag (ACC_FLAG_TYPE, 0-8) を「今すべきこと」に翻訳するテーブル。
+// 7=Green, 8=OrangeはベースのAC(0-6)には無いACC独自拡張値。
 const FLAG_INFO: Record<number, { label: string; advice: string; tone: 'neutral' | 'caution' | 'danger' | 'info' }> = {
-  0: { label: 'クリア (No Flag)', advice: '通常走行', tone: 'neutral' },
+  0: { label: 'クリア', advice: '通常走行', tone: 'neutral' },
   1: { label: 'ブルーフラッグ', advice: '後方に速い車。道を譲ってください', tone: 'info' },
   2: { label: 'イエローフラッグ', advice: 'オーバーテイク禁止。燃費セーブのチャンス', tone: 'caution' },
   3: { label: 'ブラックフラッグ', advice: 'ピットイン指示の可能性があります', tone: 'danger' },
   4: { label: 'ホワイトフラッグ', advice: '低速車が前方にいます。注意', tone: 'caution' },
   5: { label: 'チェッカーフラッグ', advice: 'セッション終了', tone: 'info' },
   6: { label: 'ペナルティフラッグ', advice: 'ペナルティが課されています', tone: 'danger' },
+  7: { label: 'グリーンフラッグ', advice: '通常走行(クリア)', tone: 'neutral' },
+  8: { label: 'オレンジフラッグ', advice: '車両にダメージの可能性。ピットで点検を', tone: 'danger' },
 };
 
 // ACCのAC_SESSION_TYPE (-1=Unknown,0=Practice,1=Qualify,2=Race,3=Hotlap,4=TimeAttack,5=Drift,6=Drag)
 const SESSION_TYPE_LABELS: Record<number, string> = {
-  [-1]: 'Unknown',
-  0: 'Practice',
-  1: 'Qualify',
-  2: 'Race',
-  3: 'Hotlap',
-  4: 'Time Attack',
-  5: 'Drift',
-  6: 'Drag',
+  [-1]: '不明',
+  0: '練習走行',
+  1: '予選',
+  2: 'レース',
+  3: 'ホットラップ',
+  4: 'タイムアタック',
+  5: 'ドリフト',
+  6: 'ドラッグ',
 };
 
 // タイヤ温度・摩耗の判定しきい値(GT3一般的な目安。車種により異なるため参考値)
@@ -106,6 +136,20 @@ const TYRE_TEMP_HOT_MAX = 100; // これ以下: Optimal, 超えたらOverheated
 const TYRE_WEAR_CAUTION = 15; // %, これ以上でCaution
 const TYRE_WEAR_REPLACE = 30; // %, これ以上でReplace(ACC仕様: 0=新品,100=完全摩耗)
 const TYRE_LABELS = ['FL', 'FR', 'RL', 'RR'];
+
+// 内部ロジックでは英語のステータス値を使い、表示のときだけ日本語に変換する
+const CONDITION_LABEL_JA: Record<string, string> = {
+  Dry: 'ドライ',
+  Damp: 'やや濡れ',
+  Wet: 'ウェット',
+  'Heavy Wet': '大雨',
+};
+const TYRE_STATUS_LABEL_JA: Record<string, string> = {
+  Optimal: '適正',
+  Cold: '温度低い',
+  Overheated: '過熱',
+  Replace: '要交換',
+};
 
 export default function App() {
   const [raceDuration, setRaceDuration] = useState<number | ''>(60);
@@ -161,7 +205,7 @@ export default function App() {
 
   // ACC Bridge Sync State
   const [accBridgeStatus, setAccBridgeStatus] = useState<ConnectionStatus>('disconnected');
-  const [accBridgeUrl, setAccBridgeUrl] = useState(() => localStorage.getItem('acc-bridge-url') || DEFAULT_ACC_BRIDGE_URL);
+  const [accBridgeUrl, setAccBridgeUrl] = useState(() => localStorage.getItem('acc-bridge-url') || getDefaultAccBridgeUrl());
   const [isAccBridgeModalOpen, setIsAccBridgeModalOpen] = useState(false);
   const [accBridgeErrorMsg, setAccBridgeErrorMsg] = useState('');
   const [accBridgeTelemetry, setAccBridgeTelemetry] = useState<AccBridgeTelemetry | null>(null);
@@ -215,6 +259,32 @@ export default function App() {
       return;
     }
 
+    // --- 総周回数の自動検出(周回数ベースのセッションのみ。時間ベースなら0が来る) ---
+    if (typeof telemetry.numberOfLaps === 'number' && telemetry.numberOfLaps > 0) {
+      setAutoTotalLaps(telemetry.numberOfLaps);
+    }
+
+    // --- ラップタイムの自動検出(直近のラップがあればそちらを、無ければベストラップを使う) ---
+    const parsedLastLap = parseLapTimeToSeconds(telemetry.lastLapTime);
+    const parsedBestLap = parseLapTimeToSeconds(telemetry.bestLapTime);
+    const parsedLapSeconds = parsedLastLap ?? parsedBestLap;
+    if (parsedLapSeconds !== null) {
+      setLapMin(Math.floor(parsedLapSeconds / 60));
+      setLapSec(roundTo(parsedLapSeconds % 60, 3));
+    }
+
+    // --- 義務ピット数の自動検出・消化数の自動追跡 ---
+    // missingMandatoryPits = 「残り」必要義務ピット数。初回受信時の値を総数の基準とし、
+    // そこからの減少分を「消化済み」として自動反映する。
+    if (typeof telemetry.missingMandatoryPits === 'number' && Number.isFinite(telemetry.missingMandatoryPits)) {
+      if (mandatoryPitsBaselineRef.current === null) {
+        mandatoryPitsBaselineRef.current = telemetry.missingMandatoryPits;
+        setMandatoryPitStops(telemetry.missingMandatoryPits);
+      }
+      const completed = Math.max(0, mandatoryPitsBaselineRef.current - telemetry.missingMandatoryPits);
+      setCompletedMandatoryPits(completed);
+    }
+
     // --- ピット入退場の検知 ---
     const inPitNow = !!(telemetry.isInPit || telemetry.isInPitLane);
     if (inPitNow) {
@@ -223,10 +293,13 @@ export default function App() {
     }
     if (wasInPitRef.current && !inPitNow) {
       // ピットレーンを出た瞬間 = 想定外を含むピット作業の完了を検知
-      setPitExitPrompt({
-        lap: typeof telemetry.lap === 'number' ? telemetry.lap : '',
-        fuel: typeof telemetry.fuel === 'number' ? roundTo(telemetry.fuel, 1) : '',
-      });
+      // ただしmissingMandatoryPitsで自動追跡できている場合は、二重に確認する必要が無いので出さない
+      if (mandatoryPitsBaselineRef.current === null) {
+        setPitExitPrompt({
+          lap: typeof telemetry.lap === 'number' ? telemetry.lap : '',
+          fuel: typeof telemetry.fuel === 'number' ? roundTo(telemetry.fuel, 1) : '',
+        });
+      }
     }
     wasInPitRef.current = inPitNow;
 
@@ -549,8 +622,9 @@ export default function App() {
 
     const raceDurationInSeconds = duration * 60;
     const rawLaps = raceDurationInSeconds / lapTimeInSeconds;
-    
-    const raceLaps = Math.ceil(rawLaps);
+
+    // ACCがレース開始前に教えてくれる周回数(周回数ベースのセッション)があればそちらを優先する
+    const raceLaps = autoTotalLaps ?? Math.ceil(rawLaps);
     const totalLaps = raceLaps + extra;
     const totalFuel = Math.ceil(totalLaps * fpl);
 
@@ -809,6 +883,7 @@ export default function App() {
     lapSec,
     fuelPerLap,
     extraLaps,
+    autoTotalLaps,
     wetLapMin,
     wetLapSec,
     wetFuelPerLap,
@@ -851,7 +926,12 @@ export default function App() {
       ? Math.max(0, (results.totalFuelNeededForCoverage + reserve) - fuel)
       : null;
 
-    return { fuel, fpl, remainingLaps, lapsToFinish, margin, refuelNeeded, isLow, marginThreshold };
+    // 推奨ピットラップ: 安全マージン分を残した状態で走り切れる最後のラップ番号
+    const recommendedPitLap = cLap > 0
+      ? cLap + Math.max(0, Math.floor(remainingLaps - marginThreshold))
+      : null;
+
+    return { fuel, fpl, remainingLaps, lapsToFinish, margin, refuelNeeded, isLow, marginThreshold, recommendedPitLap };
   }, [currentFuel, fuelPerLap, currentLap, results, minReserveFuel, safetyMarginLaps, alertsEnabled]);
 
   // Weather Engine: trackGripStatus(0-6: Green/Fast/Optimum/Greasy/Damp/Wet/Flooded)を
@@ -892,6 +972,54 @@ export default function App() {
     };
   }, [accBridgeTelemetry]);
 
+  // 降雨予測による戦略切替の提案(ドライ路面のまま予報が悪化し始めた瞬間に1回だけ出す)
+  const [rainSwitchPrompt, setRainSwitchPrompt] = useState(false);
+  const rainSwitchPromptShownRef = useRef(false);
+  useEffect(() => {
+    if (weatherEngine?.trend === 'increasing' && weatherEngine.condition === 'Dry' && !rainSwitchPromptShownRef.current) {
+      rainSwitchPromptShownRef.current = true;
+      setRainSwitchPrompt(true);
+    }
+    if (weatherEngine && weatherEngine.trend !== 'increasing') {
+      rainSwitchPromptShownRef.current = false;
+    }
+  }, [weatherEngine?.trend, weatherEngine?.condition]);
+
+  // Stint Progress: 現在の周回がresults.stintsのどこに位置するかを見つけ、
+  // スティント開始時からの燃料消費/周回数で進捗を出し、ピット予想までの時間を見積もる。
+  const stintProgress = useMemo(() => {
+    const cLap = Number(currentLap) || 0;
+    if (cLap <= 0 || !results.isEmergency || results.stints.length === 0) return null;
+
+    let stint = results.stints.find(s => cLap >= s.startLap && cLap < s.endLap);
+    if (!stint) stint = results.stints[results.stints.length - 1];
+    if (!stint) return null;
+
+    const totalStintLaps = Math.max(1, stint.endLap - stint.startLap);
+    const lapsDone = Math.max(0, Math.min(totalStintLaps, cLap - stint.startLap));
+    const lapsProgress = lapsDone / totalStintLaps;
+
+    const fuel = Number(currentFuel);
+    const fuelProgress = fuel > 0 && stint.targetFuelInTank > 0
+      ? Math.max(0, Math.min(1, (stint.targetFuelInTank - fuel) / stint.targetFuelInTank))
+      : null;
+
+    const lapsRemaining = Math.max(0, stint.endLap - cLap);
+    const lapSeconds = (Number(lapMin) || 0) * 60 + (Number(lapSec) || 0);
+    const etaMinutes = lapSeconds > 0 ? (lapsRemaining * lapSeconds) / 60 : null;
+
+    return {
+      label: stint.label,
+      startLap: stint.startLap,
+      endLap: stint.endLap,
+      lapsDone,
+      totalStintLaps,
+      lapsProgress,
+      fuelProgress,
+      etaMinutes,
+    };
+  }, [currentLap, currentFuel, results, lapMin, lapSec]);
+
   // Race Control: ACCのflag(0-6)を、そのまま「今すべきこと」に翻訳する。
   const raceControl = useMemo(() => {
     const t = accBridgeTelemetry;
@@ -926,22 +1054,40 @@ export default function App() {
     const severity = { Optimal: 0, Cold: 1, Overheated: 2, Replace: 3 } as const;
     const worst = corners.reduce((a, b) => (severity[b.status] > severity[a.status] ? b : a));
 
-    return { corners, overallStatus: worst.status, wearCaution: corners.some(c => c.wear >= TYRE_WEAR_CAUTION) };
+    // 燃料の状況に関わらず、摩耗が閾値を超えたコーナーがあればピット推奨を出す
+    const pitRecommended = corners.some(c => c.wear >= TYRE_WEAR_REPLACE);
+    const worstWear = Math.max(...corners.map(c => c.wear));
+
+    return {
+      corners,
+      overallStatus: worst.status,
+      wearCaution: corners.some(c => c.wear >= TYRE_WEAR_CAUTION),
+      pitRecommended,
+      worstWear,
+    };
   }, [accBridgeTelemetry, tyrePressureMin, tyrePressureMax]);
 
   // Session Engine
   const sessionEngine = useMemo(() => {
     const t = accBridgeTelemetry;
     if (!t || t.connected === false || typeof t.sessionType !== 'number') return null;
-    const label = SESSION_TYPE_LABELS[t.sessionType] ?? `Unknown(${t.sessionType})`;
-    const timeLeftSec = typeof t.sessionTimeLeft === 'number' ? Math.max(0, Math.round(t.sessionTimeLeft)) : null;
+    const label = SESSION_TYPE_LABELS[t.sessionType] ?? `不明(${t.sessionType})`;
+    const lapsBased = typeof t.numberOfLaps === 'number' && t.numberOfLaps > 0;
+
+    const rawTimeLeftSec = typeof t.sessionTimeLeft === 'number' && Number.isFinite(t.sessionTimeLeft)
+      ? Math.max(0, Math.round(t.sessionTimeLeft))
+      : null;
+    // 周回数ベースのセッションでは残り時間が実質無意味な値(上限値など)を返すことがあるため表示しない。
+    // また6時間(21600秒)を超えるような値は単位の取り違え等の可能性が高いため異常値として弾く。
+    const timeLeftSec = !lapsBased && rawTimeLeftSec !== null && rawTimeLeftSec < 21600 ? rawTimeLeftSec : null;
     const mm = timeLeftSec !== null ? Math.floor(timeLeftSec / 60) : null;
     const ss = timeLeftSec !== null ? timeLeftSec % 60 : null;
     return {
       label,
       timeLeftSec,
       timeLeftDisplay: mm !== null && ss !== null ? `${mm}:${String(ss).padStart(2, '0')}` : null,
-      numberOfLaps: typeof t.numberOfLaps === 'number' && t.numberOfLaps > 0 ? t.numberOfLaps : null,
+      numberOfLaps: lapsBased ? t.numberOfLaps! : null,
+      rawTimeLeftSec,
     };
   }, [accBridgeTelemetry]);
 
@@ -1183,8 +1329,36 @@ export default function App() {
           </div>
         )}
 
+        {rainSwitchPrompt && (
+          <div className="bg-sky-500/10 border border-sky-500/40 rounded-2xl p-4 mb-4 sm:mb-6 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
+            <div className="flex items-start gap-3">
+              <CloudRain className="w-5 h-5 text-sky-400 flex-shrink-0 mt-0.5" />
+              <div className="text-sm text-sky-100">
+                <p className="font-bold text-sky-400">10分後の降雨予報が悪化しています</p>
+                <p className="text-xs text-sky-200/80 mt-0.5">
+                  現在はまだドライですが、ウェット戦略への切り替えを検討してください。
+                </p>
+              </div>
+            </div>
+            <div className="flex gap-2 w-full sm:w-auto">
+              <button
+                onClick={() => { setIsRaining(true); setRainSwitchPrompt(false); }}
+                className="flex-1 sm:flex-none bg-sky-500 hover:bg-sky-400 text-slate-900 text-sm font-bold px-4 py-2 rounded-xl transition-colors whitespace-nowrap"
+              >
+                ウェット戦略に切替
+              </button>
+              <button
+                onClick={() => setRainSwitchPrompt(false)}
+                className="flex-1 sm:flex-none bg-slate-800 hover:bg-slate-700 text-slate-300 text-sm font-medium px-4 py-2 rounded-xl transition-colors whitespace-nowrap"
+              >
+                閉じる
+              </button>
+            </div>
+          </div>
+        )}
+
         {fuelEngine && (
-          <div className="bg-gradient-to-br from-slate-900 to-slate-950 border border-slate-800 rounded-2xl p-4 sm:p-6 mb-4 sm:mb-6">
+          <div className={`bg-gradient-to-br from-slate-900 to-slate-950 border border-slate-800 rounded-2xl ${isSimpleMode ? 'p-2.5 mb-2.5' : 'p-4 sm:p-6 mb-4 sm:mb-6'}`}>
             <div className="flex items-center justify-between mb-3 sm:mb-4">
               <h2 className="text-sm sm:text-base font-bold text-white flex items-center">
                 <Fuel className="w-4 h-4 sm:w-5 sm:h-5 mr-2 text-emerald-400" />
@@ -1241,6 +1415,12 @@ export default function App() {
                 </div>
               )}
             </div>
+            {fuelEngine.recommendedPitLap !== null && (
+              <div className="mt-3 bg-cyan-500/10 border border-cyan-500/30 rounded-xl p-3 text-cyan-400 text-xs sm:text-sm font-bold flex items-center justify-between">
+                <span>推奨ピットイン ラップ</span>
+                <span className="text-base sm:text-lg">Lap {fuelEngine.recommendedPitLap} まで</span>
+              </div>
+            )}
             {fuelEngine.isLow && fuelEngine.margin !== null && (
               <div className="mt-3 bg-red-500/10 border border-red-500/40 rounded-xl p-3 text-red-400 text-xs sm:text-sm font-bold flex items-start sm:items-center">
                 <AlertTriangle className="w-4 h-4 mr-2 flex-shrink-0 mt-0.5 sm:mt-0" />
@@ -1255,7 +1435,57 @@ export default function App() {
           </div>
         )}
 
-        {(weatherEngine || raceControl) && (
+        {stintProgress && (
+          <div className={`bg-gradient-to-br from-slate-900 to-slate-950 border border-slate-800 rounded-2xl ${isSimpleMode ? 'p-2.5 mb-2.5' : 'p-4 sm:p-6 mb-4 sm:mb-6'}`}>
+            <div className="flex items-center justify-between mb-2">
+              <h2 className="text-sm sm:text-base font-bold text-white flex items-center">
+                <Timer className="w-4 h-4 sm:w-5 sm:h-5 mr-2 text-orange-400" />
+                スティント進捗
+              </h2>
+              <span className="text-xs text-slate-400">{stintProgress.label}</span>
+            </div>
+            <div className="w-full bg-slate-950 rounded-full h-3 overflow-hidden">
+              <div
+                className="h-full bg-gradient-to-r from-orange-500 to-orange-400 transition-all"
+                style={{ width: `${Math.round((stintProgress.fuelProgress ?? stintProgress.lapsProgress) * 100)}%` }}
+              />
+            </div>
+            <div className="flex items-center justify-between mt-2 text-xs text-slate-400">
+              <span>Lap {stintProgress.startLap} → {stintProgress.endLap}({stintProgress.lapsDone}/{stintProgress.totalStintLaps}周)</span>
+              {stintProgress.etaMinutes !== null && (
+                <span>ピットまで 約{stintProgress.etaMinutes.toFixed(0)}分</span>
+              )}
+            </div>
+          </div>
+        )}
+
+        {isSimpleMode && (
+          (raceControl && raceControl.tone !== 'neutral') || tyreEngine?.pitRecommended || weatherEngine?.trend === 'increasing'
+        ) && (
+          <div className="flex flex-wrap gap-2 mb-2.5">
+            {raceControl && raceControl.tone !== 'neutral' && (
+              <span className={`text-[11px] font-bold px-2.5 py-1 rounded-full border flex items-center gap-1 ${
+                raceControl.tone === 'danger' ? 'text-red-400 border-red-500/40 bg-red-500/10' :
+                raceControl.tone === 'caution' ? 'text-yellow-400 border-yellow-500/40 bg-yellow-500/10' :
+                'text-blue-400 border-blue-500/40 bg-blue-500/10'
+              }`}>
+                <Flag className="w-3 h-3" /> {raceControl.label}
+              </span>
+            )}
+            {tyreEngine?.pitRecommended && (
+              <span className="text-[11px] font-bold px-2.5 py-1 rounded-full border border-red-500/40 bg-red-500/10 text-red-400 flex items-center gap-1">
+                <Gauge className="w-3 h-3" /> タイヤ交換推奨
+              </span>
+            )}
+            {weatherEngine?.trend === 'increasing' && (
+              <span className="text-[11px] font-bold px-2.5 py-1 rounded-full border border-sky-500/40 bg-sky-500/10 text-sky-400 flex items-center gap-1">
+                <CloudRain className="w-3 h-3" /> 雨予報あり
+              </span>
+            )}
+          </div>
+        )}
+
+        {!isSimpleMode && (weatherEngine || raceControl) && (
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-4 sm:mb-6">
             {weatherEngine && (
               <div className="bg-gradient-to-br from-slate-900 to-slate-950 border border-slate-800 rounded-2xl p-4 sm:p-6">
@@ -1270,16 +1500,16 @@ export default function App() {
                     weatherEngine.condition === 'Wet' ? 'text-orange-400 border-orange-500/30 bg-orange-500/10' :
                     'text-red-400 border-red-500/30 bg-red-500/10'
                   }`}>
-                    {weatherEngine.condition}
+                    {CONDITION_LABEL_JA[weatherEngine.condition] ?? weatherEngine.condition}
                   </span>
                 </div>
                 <div className="grid grid-cols-2 gap-2 text-sm">
                   <div className="bg-slate-950/60 rounded-xl p-2.5">
-                    <div className="text-[11px] text-slate-500">Track Grip</div>
+                    <div className="text-[11px] text-slate-500">路面グリップ</div>
                     <div className="text-white font-bold">{weatherEngine.gripLabel}</div>
                   </div>
                   <div className="bg-slate-950/60 rounded-xl p-2.5">
-                    <div className="text-[11px] text-slate-500">Road Temp</div>
+                    <div className="text-[11px] text-slate-500">路面温度</div>
                     <div className="text-white font-bold">{weatherEngine.roadTemp !== null ? `${weatherEngine.roadTemp.toFixed(1)}°C` : '-'}</div>
                   </div>
                 </div>
@@ -1324,7 +1554,7 @@ export default function App() {
           </div>
         )}
 
-        {(tyreEngine || sessionEngine) && (
+        {!isSimpleMode && (tyreEngine || sessionEngine) && (
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 mb-4 sm:mb-6">
             {tyreEngine && (
               <div className="bg-gradient-to-br from-slate-900 to-slate-950 border border-slate-800 rounded-2xl p-4 sm:p-6">
@@ -1338,7 +1568,7 @@ export default function App() {
                     tyreEngine.overallStatus === 'Replace' ? 'text-red-400 border-red-500/30 bg-red-500/10' :
                     'text-yellow-400 border-yellow-500/30 bg-yellow-500/10'
                   }`}>
-                    {tyreEngine.overallStatus}
+                    {TYRE_STATUS_LABEL_JA[tyreEngine.overallStatus] ?? tyreEngine.overallStatus}
                   </span>
                 </div>
                 <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
@@ -1356,7 +1586,12 @@ export default function App() {
                     </div>
                   ))}
                 </div>
-                {tyreEngine.wearCaution && (
+                {tyreEngine.pitRecommended ? (
+                  <div className="mt-3 bg-red-500/10 border border-red-500/40 rounded-xl p-3 text-red-400 text-xs sm:text-sm font-bold flex items-start sm:items-center">
+                    <AlertTriangle className="w-4 h-4 mr-2 flex-shrink-0 mt-0.5 sm:mt-0" />
+                    <span>タイヤ摩耗によるピット推奨(最大{tyreEngine.worstWear.toFixed(0)}%摩耗)。燃料残量に関わらず交換を検討してください。</span>
+                  </div>
+                ) : tyreEngine.wearCaution && (
                   <p className="text-[11px] text-yellow-400 mt-2">摩耗が進んでいるタイヤがあります(目安{TYRE_WEAR_CAUTION}%以上)。</p>
                 )}
               </div>
@@ -1370,7 +1605,7 @@ export default function App() {
                 </h2>
                 <div className="grid grid-cols-2 gap-2">
                   <div className="bg-slate-950/60 rounded-xl p-2.5">
-                    <div className="text-[11px] text-slate-500">Session</div>
+                    <div className="text-[11px] text-slate-500">セッション種別</div>
                     <div className="text-white font-bold">{sessionEngine.label}</div>
                   </div>
                   <div className="bg-slate-950/60 rounded-xl p-2.5">
@@ -1380,6 +1615,9 @@ export default function App() {
                 </div>
                 {sessionEngine.numberOfLaps && (
                   <p className="text-[11px] text-slate-400 mt-2">周回数ベースのセッション: 全{sessionEngine.numberOfLaps}周</p>
+                )}
+                {!sessionEngine.timeLeftDisplay && sessionEngine.rawTimeLeftSec !== null && (
+                  <p className="text-[11px] text-slate-600 mt-2">(参考: 生の値 {sessionEngine.rawTimeLeftSec})</p>
                 )}
               </div>
             )}
@@ -2215,7 +2453,7 @@ export default function App() {
                   value={accBridgeUrl}
                   onChange={(e) => setAccBridgeUrl(e.target.value)}
                   className="w-full bg-slate-950 border border-slate-700 rounded-lg py-2 px-3 text-white text-sm focus:outline-none focus:border-red-500"
-                  placeholder={DEFAULT_ACC_BRIDGE_URL}
+                  placeholder={getDefaultAccBridgeUrl()}
                 />
               </div>
 
