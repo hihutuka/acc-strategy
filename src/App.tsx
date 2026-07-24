@@ -82,21 +82,23 @@ const roundTo = (value: number, digits: number) => {
 };
 
 // ACCのラップタイム文字列("1:23.456" "1:23:456" "83.456" 等の揺れに対応)を秒数に変換
+// 分の桁数を1〜2桁に制限し、明らかに異常な値(共有メモリの読み取りタイミング次第で
+// 稀に発生しうる不正な文字列)を弾くため、現実的なラップタイムの範囲(10秒〜10分)でクランプする。
 function parseLapTimeToSeconds(text: string | undefined): number | null {
   if (!text) return null;
   const trimmed = text.trim();
   if (!trimmed) return null;
-  const withMinutes = trimmed.match(/^(\d+):(\d{1,2})[.:](\d{1,3})$/);
+  const withMinutes = trimmed.match(/^(\d{1,2}):(\d{1,2})[.:](\d{1,3})$/);
   if (withMinutes) {
     const [, mm, ss, ms] = withMinutes;
     const total = Number(mm) * 60 + Number(ss) + Number(ms.padEnd(3, '0')) / 1000;
-    return total > 0 ? total : null;
+    return total >= 10 && total <= 600 ? total : null;
   }
-  const secondsOnly = trimmed.match(/^(\d+)[.:](\d{1,3})$/);
+  const secondsOnly = trimmed.match(/^(\d{1,2})[.:](\d{1,3})$/);
   if (secondsOnly) {
     const [, ss, ms] = secondsOnly;
     const total = Number(ss) + Number(ms.padEnd(3, '0')) / 1000;
-    return total > 0 ? total : null;
+    return total >= 10 && total <= 600 ? total : null;
   }
   return null;
 }
@@ -264,13 +266,17 @@ export default function App() {
       setAutoTotalLaps(telemetry.numberOfLaps);
     }
 
-    // --- ラップタイムの自動検出(直近のラップがあればそちらを、無ければベストラップを使う) ---
-    const parsedLastLap = parseLapTimeToSeconds(telemetry.lastLapTime);
-    const parsedBestLap = parseLapTimeToSeconds(telemetry.bestLapTime);
-    const parsedLapSeconds = parsedLastLap ?? parsedBestLap;
-    if (parsedLapSeconds !== null) {
-      setLapMin(Math.floor(parsedLapSeconds / 60));
-      setLapSec(roundTo(parsedLapSeconds % 60, 3));
+    // --- ラップタイムの自動検出 ---
+    // lap1を完了するまで(lastLapTime等がまだ意味を持たない間)は手入力を尊重し、
+    // 上書きしない。lap2以降(=最低1周分の実データがある状態)から自動反映する。
+    if (typeof telemetry.lap === 'number' && telemetry.lap >= 1) {
+      const parsedLastLap = parseLapTimeToSeconds(telemetry.lastLapTime);
+      const parsedBestLap = parseLapTimeToSeconds(telemetry.bestLapTime);
+      const parsedLapSeconds = parsedLastLap ?? parsedBestLap;
+      if (parsedLapSeconds !== null) {
+        setLapMin(Math.floor(parsedLapSeconds / 60));
+        setLapSec(roundTo(parsedLapSeconds % 60, 3));
+      }
     }
 
     // --- 義務ピット数の自動検出・消化数の自動追跡 ---
@@ -345,9 +351,11 @@ export default function App() {
       setCurrentFuel(roundTo(telemetry.fuel, 1));
     }
 
-    // 実測燃費の履歴がまだ無い(接続直後・レース序盤)場合のみ、ブリッジ側の累積推定値で代用する
+    // 実測燃費の履歴がまだ無い(レース序盤)場合はブリッジ側の累積推定値で代用する。
+    // ただしlap1完了前(まだ1周も走っていない)は推定値自体が意味を持たないため、手入力を尊重する。
     if (
       lapFuelHistoryRef.current.length === 0 &&
+      typeof telemetry.lap === 'number' && telemetry.lap >= 1 &&
       typeof telemetry.fuelPerLap === 'number' && Number.isFinite(telemetry.fuelPerLap) && telemetry.fuelPerLap > 0
     ) {
       setFuelPerLap(roundTo(telemetry.fuelPerLap, 2));
@@ -906,7 +914,7 @@ export default function App() {
   const fuelEngine = useMemo(() => {
     const fuel = Number(currentFuel);
     const fpl = Number(fuelPerLap);
-    if (!(fuel > 0) || !(fpl > 0)) return null;
+    if (!(fuel > 0) || !(fpl > 0) || !results) return null;
 
     const cLap = Number(currentLap) || 0;
     const reserve = Math.max(0, Number(minReserveFuel) || 0);
@@ -989,7 +997,7 @@ export default function App() {
   // スティント開始時からの燃料消費/周回数で進捗を出し、ピット予想までの時間を見積もる。
   const stintProgress = useMemo(() => {
     const cLap = Number(currentLap) || 0;
-    if (cLap <= 0 || !results.isEmergency || results.stints.length === 0) return null;
+    if (cLap <= 0 || !results || !results.isEmergency || results.stints.length === 0) return null;
 
     let stint = results.stints.find(s => cLap >= s.startLap && cLap < s.endLap);
     if (!stint) stint = results.stints[results.stints.length - 1];
